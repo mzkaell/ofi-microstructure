@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Captured market data — large, regenerable from raw, and raw itself
+# is the immutable source of truth we don't want churning git history.
+data/raw/**/*.jsonl
+data/raw/**/*.log
+data/raw/snapshots/*.json
+data/processed/**/*.parquet
+
+# Keep directory structure in git
+!data/raw/**/.gitkeep
+!data/processed/**/.gitkeep
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

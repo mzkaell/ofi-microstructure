@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# Ensures the project root (where `src/` lives) is on sys.path during test
+# collection, regardless of whether tests/ has an __init__.py. Without this,
+# pytest's default "prepend" import mode only puts tests/ itself on sys.path,
+# so `from src.orderbook import ...` fails with ModuleNotFoundError.
+pythonpath = ["."]

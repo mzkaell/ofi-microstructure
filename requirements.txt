@@ -1,0 +1,18 @@
+# Core data handling
+pandas>=2.0
+numpy>=1.24
+pyarrow>=14.0        # Parquet read/write for the processed book-state tables
+
+# Statistics / modeling
+statsmodels>=0.14    # OLS with Newey-West (HAC) covariance, Wald tests
+scipy>=1.11
+
+# Plotting
+matplotlib>=3.7
+
+# Data acquisition
+websockets>=12.0     # asyncio WebSocket client for the Binance depth/trade streams
+requests>=2.31       # REST snapshot fetch
+
+# Testing
+pytest>=7.4
