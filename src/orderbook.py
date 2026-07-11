@@ -65,8 +65,10 @@ class DepthEvent:
     # all downstream windowing (never local receipt time -- see acquisition.py).
     first_update_id: int  # 'U'
     final_update_id: int  # 'u'
-    prev_final_update_id: Optional[int]  # 'pu'; None only for the very first event
-    # applied right after a snapshot, where there is no "previous" to check.
+    prev_final_update_id: Optional[int]  # 'pu'; may be absent for the very first
+    # event applied right after a snapshot (no "previous" to check), and on some
+    # feeds -- e.g. Binance.US -- is absent on every event, in which case
+    # apply_event falls back to checking 'U' continuity instead.
     bids: list[tuple[float, float]]  # [(price, qty), ...]; qty == 0 means "remove
     # this price level" per the Binance diff-stream spec, not "size is zero".
     asks: list[tuple[float, float]]
@@ -128,15 +130,28 @@ class LocalOrderBook:
         if not self._initialized:
             raise RuntimeError("apply_snapshot must be called before apply_event")
 
-        if (
-            check_gap
-            and event.prev_final_update_id is not None
-            and event.prev_final_update_id != self.last_update_id
-        ):
-            raise SequenceGapError(
-                f"event.pu={event.prev_final_update_id} != "
-                f"last_update_id={self.last_update_id}"
-            )
+        if check_gap:
+            if event.prev_final_update_id is not None:
+                if event.prev_final_update_id != self.last_update_id:
+                    raise SequenceGapError(
+                        f"event.pu={event.prev_final_update_id} != "
+                        f"last_update_id={self.last_update_id}"
+                    )
+            else:
+                # Some feeds (e.g. Binance.US, as opposed to Binance.com) never
+                # populate `pu` on any event -- not just the post-resync one this
+                # class otherwise expects it to be absent on. Falling back to a
+                # no-op here would disable gap detection for the entire stream:
+                # a dropped/reordered message would silently leave stale price
+                # levels on one side of the book while the other side keeps
+                # moving, eventually crossing the spread. Binance's pre-`pu`
+                # algorithm covers exactly this case: the new event's `U` must
+                # pick up immediately after the last applied event's `u`.
+                if event.first_update_id != self.last_update_id + 1:
+                    raise SequenceGapError(
+                        f"event.U={event.first_update_id} != "
+                        f"last_update_id + 1={self.last_update_id + 1}"
+                    )
 
         for price, qty in event.bids:
             if qty == 0:

@@ -125,6 +125,40 @@ def test_gap_triggers_resync_not_silent_patch():
     assert book.last_update_id == 104
 
 
+def test_gap_is_caught_via_U_when_pu_is_always_absent():
+    """Some feeds (e.g. Binance.US) never populate `pu` on any event, not just the
+    post-resync one. Gap detection must then fall back to checking `U` continuity
+    -- if it silently no-ops instead (treating "pu is None" as "nothing to check"),
+    a dropped message goes undetected and the book is left permanently corrupted
+    with no resync ever triggered."""
+    snap1 = Snapshot(last_update_id=100, bids=[(99.0, 1.0)], asks=[(101.0, 1.0)])
+    snap2 = Snapshot(last_update_id=103, bids=[(100.0, 5.0)], asks=[(103.0, 5.0)])
+    events = [
+        DepthEvent(1, 101, 101, None, bids=[], asks=[]),  # valid, chains to snap1
+        DepthEvent(2, 102, 102, None, bids=[], asks=[]),  # valid
+        DepthEvent(3, 999, 103, None, bids=[], asks=[]),  # BOGUS U -> gap
+        DepthEvent(4, 104, 104, None, bids=[], asks=[(104.0, 1.0)]),  # bridges snap2
+    ]
+    fetch = snapshot_fetcher(snap1, snap2)
+    resync_messages = []
+
+    book = None
+    resync_flags = []
+    for book, _, is_resync in resync_and_replay(
+        iter(events), fetch, on_resync=resync_messages.append
+    ):
+        resync_flags.append(is_resync)
+
+    assert fetch.calls["calls"] == 2, "must have refetched a snapshot after the gap"
+    assert len(resync_messages) == 1
+    assert "gap" in resync_messages[0]
+    assert resync_flags == [True, False, True]
+    assert book.best_bid == (100.0, 5.0)
+    assert book.asks == {103.0: 5.0, 104.0: 1.0}
+    assert book.last_update_id == 104
+    assert book.spread == 3.0  # would be negative if event 3 had been misapplied
+
+
 def test_stale_duplicate_event_is_dropped_not_applied():
     """An old/duplicate event (u <= snapshot.lastUpdateId) arriving in the buffer
     must be discarded, not applied -- applying it would double-count an update
