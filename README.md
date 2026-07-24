@@ -94,17 +94,19 @@ reflect whatever the data actually shows:*
 
 ## Status & Roadmap
 
-**Built and tested (44 passing unit tests):**
+**Built and tested (51 passing unit tests):**
 - [x] Live collector with automatic reconnect/backoff and crash-safe append-only storage
 - [x] Order-book reconstruction with gap detection and resync (see [Data Integrity](#data-integrity-what-went-wrong-and-how-it-was-caught) below)
 - [x] Event-level and depth-weighted OFI, fixed-window aggregation, forward-return targets
-- [x] OLS regression vs. a training-mean baseline
+- [x] AR(1)-on-returns baseline feature (trailing same-horizon return)
+- [x] Signed trade-flow (trade-imbalance) baseline feature, parsed from the raw trade capture
+- [x] OLS regression vs. a training-mean baseline, run for all four feature sets
+      (`ofi_best`, `ofi_multilevel`, `trade_imbalance`, `ar1`) — the OFI-vs-baselines
+      comparison table from the original spec
 - [x] Walk-forward out-of-sample R², Newey-West HAC significance, block-bootstrap CIs
 - [x] R²-vs-horizon decay plot, generated programmatically from results (not hand-drawn)
 
 **Not yet built:**
-- [ ] AR(1)-on-returns and signed-trade-flow baselines (to show OFI adds information beyond
-      naive momentum/mean-reversion and beyond simple trade flow)
 - [ ] Ridge regression over the multi-level OFI feature set
 - [ ] Purge/embargo windows at walk-forward fold boundaries (Lopez de Prado-style), so no
       feature/target pair straddles a train/test split
@@ -144,14 +146,14 @@ rather than glossing over:
 src/
   acquisition.py     WebSocket collector + REST snapshot fetch, CLI entrypoint
   orderbook.py        LocalOrderBook state machine, resync/replay, batch reconstruction
-  features.py          OFI computation, window aggregation, forward-return targets
+  features.py          OFI, trailing/forward returns, trade-imbalance, window aggregation
   modeling.py          OLS fit, training-mean baseline
   evaluation.py        walk-forward splits, OOS R², Newey-West, block bootstrap
 scripts/
   sanity_check.py       Stage 1 data-quality report (spreads, gaps, latency, plots)
   run_ofi_study.py       end-to-end Stage 2-4 run, writes reports/results.csv
   plot_results.py         Stage 5 R²-vs-horizon decay figure from results.csv
-tests/                 44 tests, one file per src/ + scripts/ module
+tests/                 51 tests, one file per src/ + scripts/ module
 data/
   raw/                 immutable capture (gitignored — regenerate via acquisition.py)
   processed/           reconstructed book states + features (gitignored — rebuildable from raw)
@@ -169,7 +171,7 @@ cd ofi-microstructure
 python -m venv .venv
 .venv\Scripts\activate        # Windows; use `source .venv/bin/activate` on macOS/Linux
 pip install -r requirements.txt
-pytest tests/ -v               # all 44 should pass
+pytest tests/ -v               # all 51 should pass
 ```
 
 ## Usage
