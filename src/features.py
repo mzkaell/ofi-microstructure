@@ -173,6 +173,19 @@ def compute_targets(
 
     Horizons must be positive integer multiples of window_seconds so each one
     lands exactly on a window boundary instead of interpolating.
+
+    A target is also forced to NaN wherever *either* endpoint's mid_price was
+    forward-filled (`mid_price_filled`, from aggregate_windows) rather than
+    observed. A "return" computed off a stale filled price isn't a real
+    return -- for a short quiet gap this only costs a handful of rows, but an
+    extended data-collection outage forward-fills a constant price across
+    every window in the gap, which would otherwise manufacture thousands of
+    fabricated exactly-zero returns paired with exactly-zero OFI. Those
+    aren't neutral padding: a long enough run of them can dominate a single
+    walk-forward fold's out-of-sample statistics (observed directly -- an
+    unfiltered run on this project's own multi-day collector outage produced
+    a fold with out-of-sample R^2 in the thousands-of-percent-negative range,
+    driven entirely by near-zero benchmark error against fabricated data).
     """
     out = window_df.copy()
     for h in horizons_seconds:
@@ -182,8 +195,11 @@ def compute_targets(
                 f"horizon {h}s must be a positive integer multiple of "
                 f"window_seconds={window_seconds}s"
             )
-        future_mid = out["mid_price"].shift(-int(round(shift)))
-        out[f"fwd_ret_{h:g}s"] = np.log(future_mid) - np.log(out["mid_price"])
+        shift = int(round(shift))
+        future_mid = out["mid_price"].shift(-shift)
+        ret = np.log(future_mid) - np.log(out["mid_price"])
+        touches_filled = out["mid_price_filled"] | out["mid_price_filled"].shift(-shift).fillna(True)
+        out[f"fwd_ret_{h:g}s"] = ret.where(~touches_filled)
     return out
 
 

@@ -115,7 +115,11 @@ def test_aggregate_windows_sums_ofi_and_fills_quiet_bins():
 def test_targets_use_only_future_windows_and_trailing_rows_are_nan():
     idx = pd.date_range("2026-01-01", periods=5, freq="1s")
     win = pd.DataFrame(
-        {"ofi_best": [0.0] * 5, "mid_price": [100.0, 101.0, 102.0, 103.0, 104.0]},
+        {
+            "ofi_best": [0.0] * 5,
+            "mid_price": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "mid_price_filled": [False] * 5,
+        },
         index=idx,
     )
     out = compute_targets(win, window_seconds=1.0, horizons_seconds=[1.0, 2.0])
@@ -133,3 +137,33 @@ def test_horizon_must_be_integer_multiple_of_window():
     win = pd.DataFrame({"mid_price": [100.0, 101.0, 102.0]}, index=idx)
     with pytest.raises(ValueError):
         compute_targets(win, window_seconds=2.0, horizons_seconds=[3.0])
+
+
+def test_targets_spanning_a_gap_are_nan_not_fabricated():
+    """A multi-window data-collection gap forward-fills a constant mid_price
+    (aggregate_windows' mid_price_filled=True). A target must be NaN if
+    EITHER its origin or destination window falls in that gap -- otherwise a
+    long gap manufactures thousands of fake exactly-zero returns paired with
+    exactly-zero OFI, which is fabricated data, not a real observation of
+    "the market didn't move"."""
+    idx = pd.date_range("2026-01-01", periods=6, freq="1s")
+    win = pd.DataFrame(
+        {
+            "ofi_best": [0.1, 0.1, 0.0, 0.0, 0.1, 0.1],
+            "mid_price": [100.0, 100.5, 100.5, 100.5, 100.5, 101.0],
+            #                real   real  FILLED FILLED  real   real
+            "mid_price_filled": [False, False, True, True, False, False],
+        },
+        index=idx,
+    )
+    out = compute_targets(win, window_seconds=1.0, horizons_seconds=[1.0])
+
+    # row 0 -> row 1: both real, valid target.
+    assert not np.isnan(out["fwd_ret_1s"].iloc[0])
+    # row 1 -> row 2: destination (row 2) is filled -> NaN, even though row 1 itself is real.
+    assert np.isnan(out["fwd_ret_1s"].iloc[1])
+    # rows 2, 3: origin itself filled -> NaN regardless of destination.
+    assert np.isnan(out["fwd_ret_1s"].iloc[2])
+    assert np.isnan(out["fwd_ret_1s"].iloc[3])
+    # row 4 -> row 5: both real again, valid target.
+    assert not np.isnan(out["fwd_ret_1s"].iloc[4])

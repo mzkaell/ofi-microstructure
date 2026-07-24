@@ -1,8 +1,8 @@
 """
 End-to-end Stage 2-4 run: builds the OFI feature table from reconstructed
-book states, then for each (feature set, horizon) pair runs walk-forward
-out-of-sample R^2, a block-bootstrap CI on it, and a full-sample Newey-West
-significance test -- and prints one summary table.
+book states, then for each (feature set, horizon) pair runs purged/embargoed
+walk-forward out-of-sample R^2, a block-bootstrap CI on it, and a full-sample
+Newey-West significance test -- and prints one summary table.
 
 This is a research-runner script, not library code (hence living in scripts/
 rather than src/): it wires together src/features.py, src/modeling.py, and
@@ -50,8 +50,19 @@ def main() -> None:
             target_col = f"fwd_ret_{h:g}s"
             bins_per_horizon = int(round(h / args.window_seconds))
 
+            # purge = exactly the trailing training rows whose h-bin-ahead
+            # label reaches into the test set (bins_per_horizon - 1 of them);
+            # embargo = an equal-sized extra buffer against residual serial
+            # correlation beyond pure label overlap. See
+            # evaluation.walk_forward_splits's docstring for the mechanics.
             oos = run_walk_forward(
-                df, feature_cols, target_col, args.n_splits, args.min_train_fraction
+                df,
+                feature_cols,
+                target_col,
+                args.n_splits,
+                args.min_train_fraction,
+                purge=bins_per_horizon - 1,
+                embargo=bins_per_horizon,
             )
             r2 = block_bootstrap_r2_ci(
                 oos["y_true"],

@@ -27,6 +27,13 @@ should be set to at least the horizon-to-window ratio (e.g. horizon=10s over
 a 1s window needs maxlags>=10) so the overlap-induced autocorrelation is
 actually covered.
 
+Purge/embargo: `walk_forward_splits` also trims the trailing edge of each
+fold's training set (Lopez de Prado, *Advances in Financial Machine
+Learning*, ch. 7) so that no training row's forward-looking label reaches
+into that fold's test period, plus an additional embargo buffer against
+residual serial correlation. See its docstring for the exact mechanics and
+why only one boundary needs trimming in a pure forward-chaining design.
+
 Block bootstrap: `block_bootstrap_r2_ci` resamples the out-of-sample
 (y_true, y_pred, y_pred_baseline) triples in contiguous blocks (not
 single points) so the resampled series preserves the original's short-range
@@ -51,7 +58,11 @@ from src.modeling import fit_ols, predict_historical_mean
 
 
 def walk_forward_splits(
-    n_obs: int, n_splits: int, min_train_fraction: float = 0.5
+    n_obs: int,
+    n_splits: int,
+    min_train_fraction: float = 0.5,
+    purge: int = 0,
+    embargo: int = 0,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Yields (train_idx, test_idx) *positional* index arrays for `n_splits`
     chronological, non-overlapping, contiguous test folds covering the tail
@@ -61,9 +72,38 @@ def walk_forward_splits(
     period, exactly mimicking how a researcher re-fits as more history
     becomes available. No fold's train_idx ever contains an index >= any of
     its own test_idx.
+
+    `purge` and `embargo` (Lopez de Prado, *Advances in Financial Machine
+    Learning*, ch. 7) trim the trailing edge of each fold's training set,
+    immediately before test_start:
+
+    - `purge`: the number of trailing training rows to drop because their
+      *label* (a forward-looking target `h` bins ahead) reaches into the
+      test period even though the row itself sits before it. A training row
+      at position `test_start - 1` with an h-bin-ahead target technically
+      has its label computed from data inside the test window -- fitting on
+      it leaks test-period price information into training. Callers should
+      set `purge = horizon_bins - 1` (the exact number of trailing rows
+      whose target overlaps test_start) for whichever horizon they're
+      evaluating.
+    - `embargo`: an additional buffer of trailing training rows dropped
+      beyond the purge, as defense-in-depth against residual short-range
+      serial correlation between training and test observations that label
+      purging alone doesn't address (e.g. a feature's own autocorrelation
+      structure, not just its label's literal overlap).
+
+    Both only ever trim the *start-of-test* boundary here, not a
+    post-test boundary: unlike k-fold CV, this is a pure forward-chaining
+    walk-forward where a fold's training data is always strictly earlier in
+    time than its test data, so there is no "training data after test" for
+    an embargo on the far side to protect against -- when fold k's test
+    period is absorbed into fold k+1's training set, the *same* purge/embargo
+    trim at fold k+1's own test boundary already covers it.
     """
     if n_splits < 1:
         raise ValueError("n_splits must be >= 1")
+    if purge < 0 or embargo < 0:
+        raise ValueError("purge and embargo must be >= 0")
     min_train = int(n_obs * min_train_fraction)
     remaining = n_obs - min_train
     fold_size = remaining // n_splits
@@ -72,11 +112,18 @@ def walk_forward_splits(
             f"not enough observations ({n_obs}) for {n_splits} folds with "
             f"min_train_fraction={min_train_fraction}"
         )
+    trim = purge + embargo
     splits = []
     for k in range(n_splits):
         test_start = min_train + k * fold_size
         test_end = n_obs if k == n_splits - 1 else test_start + fold_size
-        splits.append((np.arange(0, test_start), np.arange(test_start, test_end)))
+        train_end = max(0, test_start - trim)
+        if train_end < 1:
+            raise ValueError(
+                f"purge+embargo={trim} leaves no training data before fold "
+                f"{k}'s test_start={test_start}"
+            )
+        splits.append((np.arange(0, train_end), np.arange(test_start, test_end)))
     return splits
 
 
@@ -86,16 +133,22 @@ def run_walk_forward(
     target_col: str,
     n_splits: int,
     min_train_fraction: float = 0.5,
+    purge: int = 0,
+    embargo: int = 0,
 ) -> pd.DataFrame:
     """Runs the full walk-forward procedure and returns one pooled DataFrame
     of out-of-sample rows (across all folds, concatenated in time order) with
     columns y_true, y_pred_model, y_pred_baseline. `df` must already be
     sorted by time (window_start), which build_feature_table guarantees.
+    `purge`/`embargo` are forwarded to walk_forward_splits -- see its
+    docstring for what each protects against.
     """
     assert df.index.is_monotonic_increasing, "df must be time-sorted"
     X, y = df[feature_cols], df[target_col]
     oos_chunks = []
-    for train_idx, test_idx in walk_forward_splits(len(df), n_splits, min_train_fraction):
+    for train_idx, test_idx in walk_forward_splits(
+        len(df), n_splits, min_train_fraction, purge=purge, embargo=embargo
+    ):
         X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
         X_test, y_test = X.iloc[test_idx], y.iloc[test_idx]
 

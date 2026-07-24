@@ -12,6 +12,7 @@ from src.evaluation import (
     run_walk_forward,
     walk_forward_splits,
 )
+from src.modeling import fit_ols
 
 
 def test_walk_forward_splits_are_chronological_expanding_and_cover_the_tail():
@@ -38,6 +39,33 @@ def test_walk_forward_splits_raises_when_too_few_observations_for_folds():
         walk_forward_splits(n_obs=10, n_splits=20, min_train_fraction=0.5)
 
 
+def test_purge_and_embargo_trim_the_trailing_training_edge():
+    (train_idx, test_idx), = walk_forward_splits(
+        n_obs=100, n_splits=1, min_train_fraction=0.5, purge=3
+    )
+    assert test_idx.tolist() == list(range(50, 100))
+    assert train_idx.max() == 50 - 3 - 1  # last 3 rows before test_start dropped
+
+    (train_idx2, _), = walk_forward_splits(
+        n_obs=100, n_splits=1, min_train_fraction=0.5, purge=3, embargo=4
+    )
+    assert train_idx2.max() == 50 - 3 - 4 - 1  # purge + embargo both trimmed
+
+
+def test_purge_embargo_preserve_expanding_window_across_folds():
+    splits = walk_forward_splits(n_obs=100, n_splits=5, min_train_fraction=0.5, purge=2, embargo=1)
+    prev_train_size = 0
+    for train_idx, test_idx in splits:
+        assert train_idx.max(initial=-1) <= test_idx.min() - 1 - 2 - 1  # gap of purge+embargo=3
+        assert len(train_idx) >= prev_train_size
+        prev_train_size = len(train_idx)
+
+
+def test_purge_embargo_raises_when_it_would_remove_all_training_data():
+    with pytest.raises(ValueError):
+        walk_forward_splits(n_obs=100, n_splits=1, min_train_fraction=0.5, purge=49, embargo=1)
+
+
 def test_run_walk_forward_recovers_noiseless_relationship_out_of_sample():
     idx = pd.date_range("2026-01-01", periods=100, freq="1s")
     ofi = np.linspace(-1, 1, 100)
@@ -49,6 +77,29 @@ def test_run_walk_forward_recovers_noiseless_relationship_out_of_sample():
     assert oos["y_pred_model"].tolist() == pytest.approx(oos["y_true"].tolist(), abs=1e-6)
     r2 = oos_r2(oos["y_true"], oos["y_pred_model"], oos["y_pred_baseline"])
     assert r2 == pytest.approx(1.0, abs=1e-6)
+
+
+def test_run_walk_forward_purge_excludes_boundary_row_with_test_overlapping_label():
+    """Row 19 (the last pre-test row, since test_start=20) is poisoned with a
+    label that only makes sense if it had 'seen' test-period data -- standing
+    in for a real forward-looking target whose horizon reached past
+    test_start. purge=1 must exclude exactly that row from the fit, verified
+    by matching predictions against a model fit on the manually-trimmed
+    slice; without purge, the poisoned row corrupts the fit instead."""
+    n = 40
+    idx = pd.date_range("2026-01-01", periods=n, freq="1s")
+    ofi = np.linspace(-1, 1, n)
+    poisoned = pd.DataFrame({"ofi": ofi, "ret": 0.1 * ofi}, index=idx)
+    poisoned.iloc[19, poisoned.columns.get_loc("ret")] = 999.0
+
+    expected_model = fit_ols(poisoned.iloc[:19][["ofi"]], poisoned.iloc[:19]["ret"], ["ofi"])
+    expected_pred = expected_model.predict(poisoned.iloc[20:][["ofi"]])
+
+    oos_purged = run_walk_forward(poisoned, ["ofi"], "ret", n_splits=1, min_train_fraction=0.5, purge=1)
+    assert oos_purged["y_pred_model"].tolist() == pytest.approx(expected_pred.tolist())
+
+    oos_unpurged = run_walk_forward(poisoned, ["ofi"], "ret", n_splits=1, min_train_fraction=0.5)
+    assert oos_unpurged["y_pred_model"].tolist() != pytest.approx(expected_pred.tolist())
 
 
 def test_oos_r2_is_zero_when_model_equals_baseline_and_one_when_perfect():
