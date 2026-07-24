@@ -4,11 +4,20 @@ aggregation, and the no-lookahead contract on forward-return targets. All
 synthetic/hand-computed -- no dependency on real captured data.
 """
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.features import aggregate_windows, compute_event_ofi, compute_targets
+from src.features import (
+    aggregate_trade_imbalance,
+    aggregate_windows,
+    compute_event_ofi,
+    compute_targets,
+    compute_trailing_returns,
+    load_raw_trades,
+)
 
 
 def _book_row(t, bid_p, bid_q, ask_p, ask_q, resync=False, levels=1):
@@ -167,3 +176,91 @@ def test_targets_spanning_a_gap_are_nan_not_fabricated():
     assert np.isnan(out["fwd_ret_1s"].iloc[3])
     # row 4 -> row 5: both real again, valid target.
     assert not np.isnan(out["fwd_ret_1s"].iloc[4])
+
+
+def test_trailing_returns_look_backward_and_leading_rows_are_nan():
+    """Mirror image of compute_targets: trail_ret_1s[t] should equal
+    fwd_ret_1s computed from t-1, and the *leading* (not trailing) rows are
+    the ones with no data yet."""
+    idx = pd.date_range("2026-01-01", periods=5, freq="1s")
+    win = pd.DataFrame(
+        {"mid_price": [100.0, 101.0, 102.0, 103.0, 104.0]}, index=idx
+    )
+    out = compute_trailing_returns(win, window_seconds=1.0, horizons_seconds=[1.0])
+
+    assert np.isnan(out["trail_ret_1s"].iloc[0]), "no past data yet -> NaN"
+    expected = np.log(win["mid_price"]) - np.log(win["mid_price"].shift(1))
+    assert out["trail_ret_1s"].iloc[1:].tolist() == pytest.approx(
+        expected.iloc[1:].tolist()
+    )
+
+
+def test_trailing_return_horizon_must_be_integer_multiple_of_window():
+    idx = pd.date_range("2026-01-01", periods=3, freq="1s")
+    win = pd.DataFrame({"mid_price": [100.0, 101.0, 102.0]}, index=idx)
+    with pytest.raises(ValueError):
+        compute_trailing_returns(win, window_seconds=2.0, horizons_seconds=[3.0])
+
+
+def test_load_raw_trades_signs_by_buyer_maker_flag(tmp_path):
+    """m=True -> buyer was the passive maker -> seller-initiated -> negative.
+    m=False -> buyer was the aggressor -> buyer-initiated -> positive."""
+    trades_dir = tmp_path / "trades"
+    trades_dir.mkdir()
+    lines = [
+        json.dumps({"E": 2000, "q": "1.5", "m": False}),  # buyer-initiated: +1.5
+        json.dumps({"E": 1000, "q": "0.5", "m": True}),  # seller-initiated: -0.5
+        "{not valid json",  # torn last line, must be skipped not raise
+    ]
+    (trades_dir / "trade_2026-01-01_00.jsonl").write_text("\n".join(lines) + "\n")
+
+    df = load_raw_trades(tmp_path)
+
+    assert list(df["signed_qty"]) == [-0.5, 1.5]  # sorted by event time
+    assert df.index.is_monotonic_increasing
+
+
+def test_load_raw_trades_empty_when_no_files(tmp_path):
+    (tmp_path / "trades").mkdir()
+    df = load_raw_trades(tmp_path)
+    assert df.empty
+    assert "signed_qty" in df.columns
+
+
+def test_aggregate_trade_imbalance_sums_into_windows_and_fills_quiet_bins():
+    idx = pd.date_range("2026-01-01", periods=2, freq="1s", tz="UTC")  # 2 windows of 1s
+    trades = pd.DataFrame(
+        {"signed_qty": [1.0, 2.0, -0.5]},
+        index=pd.to_datetime(
+            ["2026-01-01 00:00:00.100", "2026-01-01 00:00:00.900", "2026-01-01 00:00:02.100"],
+            utc=True,
+        ),
+    )
+    # trades fall in windows [00:00:00,00:00:01) and [00:00:02,00:00:03) --
+    # the second window isn't in `idx` at all, so it must be dropped, and the
+    # untouched window [00:00:01,00:00:02) must come back as 0.0, not NaN.
+    result = aggregate_trade_imbalance(trades, window_seconds=1.0, full_index=idx)
+
+    assert result.loc[idx[0]] == pytest.approx(3.0)
+    assert result.loc[idx[1]] == 0.0
+    assert len(result) == 2
+
+
+def test_aggregate_trade_imbalance_empty_trades_returns_all_zero():
+    idx = pd.date_range("2026-01-01", periods=3, freq="1s")
+    empty = pd.DataFrame({"signed_qty": pd.Series(dtype=float)})
+    result = aggregate_trade_imbalance(empty, window_seconds=1.0, full_index=idx)
+    assert (result == 0.0).all()
+    assert len(result) == 3
+
+
+def test_aggregate_trade_imbalance_raises_on_tz_mismatch():
+    """A tz-naive/aware mismatch must raise, not silently reindex to all-zero
+    (which would be indistinguishable from a genuinely quiet market)."""
+    naive_idx = pd.date_range("2026-01-01", periods=2, freq="1s")
+    aware_trades = pd.DataFrame(
+        {"signed_qty": [1.0]},
+        index=pd.to_datetime(["2026-01-01 00:00:00.500"], utc=True),
+    )
+    with pytest.raises(ValueError):
+        aggregate_trade_imbalance(aware_trades, window_seconds=1.0, full_index=naive_idx)

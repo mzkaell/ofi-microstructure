@@ -48,7 +48,9 @@ lookahead bias (see CLAUDE.md):
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -203,15 +205,121 @@ def compute_targets(
     return out
 
 
+def compute_trailing_returns(
+    window_df: pd.DataFrame, window_seconds: float, horizons_seconds: list[float]
+) -> pd.DataFrame:
+    """Adds one trailing (backward-looking) log-return column per horizon --
+    the AR(1)-on-returns baseline feature from CLAUDE.md:
+    trail_ret_{h}s[t] = log(mid_price[t]) - log(mid_price[t - h])
+
+    This is the mirror image of compute_targets: same horizon, opposite
+    direction. Predicting fwd_ret_{h}s from trail_ret_{h}s tests whether pure
+    momentum/mean-reversion in returns alone explains any predictability, so
+    OFI's out-of-sample R^2 has to beat this, not just beat zero. The leading
+    `horizon / window_seconds` rows of each column are NaN (no past data yet)
+    rather than filled, matching compute_targets' handling of the trailing
+    edge -- callers drop NaNs per-horizon, never impute.
+    """
+    out = window_df.copy()
+    for h in horizons_seconds:
+        shift = h / window_seconds
+        if shift != round(shift) or shift < 1:
+            raise ValueError(
+                f"horizon {h}s must be a positive integer multiple of "
+                f"window_seconds={window_seconds}s"
+            )
+        past_mid = out["mid_price"].shift(int(round(shift)))
+        out[f"trail_ret_{h:g}s"] = np.log(out["mid_price"]) - np.log(past_mid)
+    return out
+
+
+def load_raw_trades(raw_dir: Path) -> pd.DataFrame:
+    """Loads and parses every trade JSONL file under raw_dir/trades, returning
+    a DataFrame indexed by exchange event time (Binance's `E`, never local
+    receipt time -- see acquisition.py) with one column, `signed_qty`: +qty
+    if the trade was buyer-initiated (m=False -- the buyer was the aggressor,
+    NOT the passive maker), -qty if seller-initiated (m=True). This is the
+    standard trade-sign convention and the raw input to the trade-imbalance
+    baseline feature. Unparseable lines are skipped, same crash-safety
+    rationale as orderbook.load_raw_depth_events (a torn last line from an
+    abrupt kill is expected, not an error).
+    """
+    trades_dir = Path(raw_dir) / "trades"
+    rows = []
+    for path in sorted(trades_dir.glob("trade_*.jsonl")):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    qty = float(rec["q"])
+                    signed_qty = -qty if rec["m"] else qty
+                    rows.append({"event_time_ms": rec["E"], "signed_qty": signed_qty})
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    continue
+    if not rows:
+        return pd.DataFrame(
+            {"signed_qty": pd.Series(dtype=float)},
+            index=pd.DatetimeIndex([], name="event_time", tz="UTC"),
+        )
+    df = pd.DataFrame(rows).sort_values("event_time_ms")
+    df["event_time"] = pd.to_datetime(df["event_time_ms"], unit="ms", utc=True)
+    return df.set_index("event_time")[["signed_qty"]]
+
+
+def aggregate_trade_imbalance(
+    trades_df: pd.DataFrame, window_seconds: float, full_index: pd.DatetimeIndex
+) -> pd.Series:
+    """Sums signed trade volume into the same tumbling windows as OFI
+    (aggregate_windows), reindexed onto `full_index` -- the OFI/target table's
+    own window index -- so the two features line up bin-for-bin without a
+    separate join step at the call site. A window with zero trades gets 0.0
+    (no signed flow observed -- correct, not missing; unlike OFI there's no
+    "gap" concept for trades since they're independent of book reconstruction,
+    so every empty bin really is just quiet, not unknown)."""
+    freq = pd.Timedelta(seconds=window_seconds)
+    if trades_df.empty:
+        return pd.Series(0.0, index=full_index, name="trade_imbalance")
+    # A tz-naive/tz-aware mismatch between the two indexes makes `reindex`
+    # silently match nothing rather than raise -- every bin would quietly
+    # come back 0.0, indistinguishable from "genuinely no trades happened."
+    # Both indexes are tz-aware UTC everywhere in this codebase, so this
+    # should never trigger in practice; it exists to fail loudly instead of
+    # guessing if that invariant is ever broken by a future change.
+    if bool(trades_df.index.tz is None) != bool(full_index.tz is None):
+        raise ValueError(
+            "trades_df and full_index must both be tz-aware or both tz-naive "
+            f"(got trades tz={trades_df.index.tz}, full_index tz={full_index.tz})"
+        )
+    bin_start = trades_df.index.floor(freq)
+    summed = trades_df.groupby(bin_start)["signed_qty"].sum()
+    return summed.reindex(full_index).fillna(0.0).rename("trade_imbalance")
+
+
 def build_feature_table(
     processed_dir: Path,
     window_seconds: float,
     horizons_seconds: list[float],
     depth_levels: int = 5,
+    raw_dir: Optional[Path] = None,
 ) -> pd.DataFrame:
+    """Builds the full Stage 2 feature table: OFI (level-1 + multilevel),
+    trailing returns (AR(1) baseline feature), forward-return targets, and --
+    if `raw_dir` is given -- the trade-imbalance baseline feature. `raw_dir`
+    is optional (rather than required) so this stays testable/usable against
+    just a processed book-state table when no raw trade capture is available.
+    """
     book = load_book_states(processed_dir)
     events = compute_event_ofi(book, levels=depth_levels)
     windows = aggregate_windows(events, window_seconds)
+    windows = compute_trailing_returns(windows, window_seconds, horizons_seconds)
+    if raw_dir is not None:
+        trades = load_raw_trades(raw_dir)
+        windows["trade_imbalance"] = aggregate_trade_imbalance(
+            trades, window_seconds, windows.index
+        )
     return compute_targets(windows, window_seconds, horizons_seconds)
 
 
@@ -221,6 +329,7 @@ def main() -> None:
         "from reconstructed book states."
     )
     parser.add_argument("--processed", type=Path, default=Path("data/processed/book"))
+    parser.add_argument("--raw", type=Path, default=Path("data/raw"))
     parser.add_argument("--out", type=Path, default=Path("data/processed/features"))
     parser.add_argument("--window-seconds", type=float, default=1.0)
     parser.add_argument(
@@ -230,7 +339,11 @@ def main() -> None:
     args = parser.parse_args()
 
     df = build_feature_table(
-        args.processed, args.window_seconds, args.horizons_seconds, args.depth_levels
+        args.processed,
+        args.window_seconds,
+        args.horizons_seconds,
+        args.depth_levels,
+        raw_dir=args.raw,
     )
     args.out.mkdir(parents=True, exist_ok=True)
     out_path = args.out / f"features_{int(args.window_seconds * 1000)}ms.parquet"

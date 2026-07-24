@@ -25,6 +25,12 @@ from src.features import build_feature_table
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the full OFI predictability study.")
     parser.add_argument("--processed", type=Path, default=Path("data/processed/book"))
+    parser.add_argument(
+        "--raw",
+        type=Path,
+        default=Path("data/raw"),
+        help="raw capture dir, used only to build the trade-imbalance baseline",
+    )
     parser.add_argument("--out", type=Path, default=Path("reports/results.csv"))
     parser.add_argument("--window-seconds", type=float, default=1.0)
     parser.add_argument(
@@ -37,16 +43,32 @@ def main() -> None:
 
     print(f"Building feature table (window={args.window_seconds}s) ...")
     df = build_feature_table(
-        args.processed, args.window_seconds, args.horizons_seconds
+        args.processed, args.window_seconds, args.horizons_seconds, raw_dir=args.raw
     )
     print(f"{len(df)} windows, {df.index[0]}..{df.index[-1]}")
 
+    # Each entry maps a feature label to a function of horizon -> feature
+    # column(s). ofi_best/ofi_multilevel/trade_imbalance are the same column
+    # at every horizon; the AR(1) baseline is horizon-specific by
+    # construction (trail_ret_{h}s is only a fair comparison against
+    # fwd_ret_{h}s of the *same* h), hence the callable instead of a fixed list.
+    feature_specs = [
+        ("ofi_best", lambda h: ["ofi_best"]),
+        ("ofi_multilevel", lambda h: ["ofi_multilevel"]),
+        ("trade_imbalance", lambda h: ["trade_imbalance"]),
+        ("ar1", lambda h: [f"trail_ret_{h:g}s"]),
+    ]
+
     rows = []
-    for feature_cols, feature_label in [
-        (["ofi_best"], "ofi_best"),
-        (["ofi_multilevel"], "ofi_multilevel"),
-    ]:
+    for feature_label, feature_cols_fn in feature_specs:
         for h in args.horizons_seconds:
+            feature_cols = feature_cols_fn(h)
+            if feature_cols[0] not in df.columns:
+                print(
+                    f"  skipping {feature_label:>15s} h={h:>4g}s: column "
+                    f"'{feature_cols[0]}' not in feature table"
+                )
+                continue
             target_col = f"fwd_ret_{h:g}s"
             bins_per_horizon = int(round(h / args.window_seconds))
 
